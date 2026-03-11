@@ -23,6 +23,7 @@ void BLEClientHID::loop() {
     case HIDState::READ_CHARS:
       this->configure_hid_client();
       this->hid_state = HIDState::NOTIFICATIONS_REGISTERING;
+      break;
     case HIDState::NOTIFICATIONS_REGISTERED:
       esp_ble_gap_update_conn_params(&this->preferred_conn_params);
       this->hid_state = HIDState::CONN_PARAMS_UPDATING;
@@ -243,9 +244,12 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
       break;
     }
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
-      if (param->notify.conn_id != this->parent()->get_conn_id()) break;
+      if (param->reg_for_notify.status != ESP_GATT_OK) {
+        ESP_LOGW(TAG, "Register for notify failed for handle 0x%04X with status=%d",
+                 param->reg_for_notify.handle, param->reg_for_notify.status);
+      }
       this->handles_waiting_for_notify_registration--;
-      if(this->handles_waiting_for_notify_registration == 0){
+      if (this->handles_waiting_for_notify_registration == 0) {
         this->hid_state = HIDState::NOTIFICATIONS_REGISTERED;
       }
       break;
