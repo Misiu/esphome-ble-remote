@@ -47,22 +47,22 @@ namespace esphome
         switch (report_item_info & HID_ITEM_SIZE_MASK)
         {
         case HID_ITEM_SIZE_32:
-          ESP_LOGD(TAG, "%X, %X, %X, %X, %X", report_item_info, report_map_data[0], report_map_data[1], report_map_data[2], report_map_data[3]);
+          ESP_LOGV(TAG, "%X, %X, %X, %X, %X", report_item_info, report_map_data[0], report_map_data[1], report_map_data[2], report_map_data[3]);
           report_map_data += 4;
           report_map_size -= 4;
           break;
         case HID_ITEM_SIZE_16:
-          ESP_LOGD(TAG, "%X, %X, %X", report_item_info, report_map_data[0], report_map_data[1]);
+          ESP_LOGV(TAG, "%X, %X, %X", report_item_info, report_map_data[0], report_map_data[1]);
           report_map_data += 2;
           report_map_size -= 2;
           break;
         case HID_ITEM_SIZE_8:
-          ESP_LOGD(TAG, "%X, %X", report_item_info, report_map_data[0]);
+          ESP_LOGV(TAG, "%X, %X", report_item_info, report_map_data[0]);
           report_map_data += 1;
           report_map_size -= 1;
           break;
         case HID_ITEM_SIZE_0:
-          ESP_LOGD(TAG, "%X", report_item_info);
+          ESP_LOGV(TAG, "%X", report_item_info);
           break;
         }
       }
@@ -106,10 +106,10 @@ namespace esphome
     {
       if ((item_info & HID_ITEM_SIZE_MASK) == HID_ITEM_SIZE_32)
       {
-        ESP_LOGD(TAG,"Parsing extedned usage: %X, %X", (uint16_t)(data >> 16), (uint16_t)data);
+        ESP_LOGV(TAG,"Parsing extended usage: %X, %X", (uint16_t)(data >> 16), (uint16_t)data);
         return HIDUsage((uint16_t)data, (uint16_t)(data >> 16));
       }
-      ESP_LOGD(TAG,"Parsing simple usage: %X, %X", usage_page, (uint16_t)data);
+      ESP_LOGV(TAG,"Parsing simple usage: %X, %X", usage_page, (uint16_t)data);
       return HIDUsage((uint16_t)data, usage_page);
     }
 
@@ -125,7 +125,7 @@ namespace esphome
 
     const HIDUsage HIDUsageList::get_usage(uint16_t index) const
     {
-      ESP_LOGD(TAG, "get usage for index %d with list size %d", index, this->usages.size());
+      ESP_LOGV(TAG, "get usage for index %d with list size %d", index, this->usages.size());
       if (index > this->usages.size())
       {
         ESP_LOGW(TAG, "Usage index out of range");
@@ -175,7 +175,7 @@ namespace esphome
 
         case HID_ITEM_TYPE_TAG_USAGE_PAGE:
         {
-          ESP_LOGD(TAG, "Usage page: %X", report_item_data);
+          ESP_LOGV(TAG, "Usage page: %X", report_item_data);
           state_table.usage_page = report_item_data;
           break;
         }
@@ -259,7 +259,7 @@ namespace esphome
         case HID_ITEM_TYPE_TAG_INPUT:
 
         {
-          ESP_LOGD(TAG, "Found input main item");
+          ESP_LOGV(TAG, "Found input main item");
           uint16_t item_flags = report_item_data;
 
           if (state_table.report_id == 0)
@@ -285,7 +285,7 @@ namespace esphome
           }
           else
           {
-            ESP_LOGD(TAG, "Creating usage range with min: %d, max: %d, page: %d", usage_range.minimum.usage, usage_range.maximum.usage, usage_range.minimum.page);
+            ESP_LOGV(TAG, "Creating usage range with min: %d, max: %d, page: %d", usage_range.minimum.usage, usage_range.maximum.usage, usage_range.minimum.page);
             usage_collection = new HIDUsageRange(usage_range.minimum, usage_range.maximum, usage_range.minimum.page);
           }
           if (item_flags & HID_IOF_VARIABLE)
