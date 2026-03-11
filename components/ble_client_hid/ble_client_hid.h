@@ -71,7 +71,7 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
                            esp_ble_gattc_cb_param_t *param) override;
 
   void dump_config() override;
-  void schedule_read_char(ble_client::BLECharacteristic *characteristic);
+  void schedule_read_char(ble_client::BLECharacteristic *characteristic, const char *name = "unknown");
   void on_gatt_read_finished(GATTReadData *data);
   void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) override;
   void read_client_characteristics();

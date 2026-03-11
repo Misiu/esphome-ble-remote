@@ -63,30 +63,55 @@ void BLEClientHID::read_client_characteristics() {
   BLEService *hid_service = this->parent()->get_service(ESP_GATT_UUID_HID_SVC);
   BLEService *generic_access_service = this->parent()->get_service(0x1800);
 
+  // === GATT Service Discovery Dump ===
+  ESP_LOGD(TAG, "=== GATT Services ===");
+  struct { BLEService *svc; const char *name; } services[] = {
+    {generic_access_service, "GenericAccess(0x1800)"},
+    {battery_service,        "Battery(0x180F)"},
+    {device_info_service,    "DeviceInfo(0x180A)"},
+    {hid_service,            "HID(0x1812)"},
+  };
+  for (auto &entry : services) {
+    if (entry.svc == nullptr) {
+      ESP_LOGD(TAG, "  Service %s: not present", entry.name);
+      continue;
+    }
+    ESP_LOGD(TAG, "  Service %s: %d characteristics", entry.name,
+             entry.svc->characteristics.size());
+    for (auto *chr : entry.svc->characteristics) {
+      ESP_LOGD(TAG, "    Char UUID=0x%04X handle=0x%04X props=0x%02X",
+               chr->uuid.get_uuid().uuid.uuid16, chr->handle, chr->properties);
+      BLEDescriptor *rpt_ref = chr->get_descriptor(ESP_GATT_UUID_RPT_REF_DESCR);
+      if (rpt_ref != nullptr) {
+        ESP_LOGD(TAG, "      RPT_REF_DESCR handle=0x%04X", rpt_ref->handle);
+      }
+    }
+  }
+
   if (generic_access_service != nullptr) {
     BLECharacteristic *device_name_char =
         generic_access_service->get_characteristic(
             ESP_GATT_UUID_GAP_DEVICE_NAME);
     BLECharacteristic *pref_conn_params_char = generic_access_service->get_characteristic(ESP_GATT_UUID_GAP_PREF_CONN_PARAM);
-    this->schedule_read_char(pref_conn_params_char);
-    this->schedule_read_char(device_name_char);
+    this->schedule_read_char(pref_conn_params_char, "GAP_PREF_CONN_PARAM");
+    this->schedule_read_char(device_name_char, "GAP_DEVICE_NAME");
   }
   if (device_info_service != nullptr) {
     BLECharacteristic *pnp_id_char =
         device_info_service->get_characteristic(ESP_GATT_UUID_PNP_ID);
-    this->schedule_read_char(pnp_id_char);
+    this->schedule_read_char(pnp_id_char, "PNP_ID");
     BLECharacteristic *manufacturer_char =
         device_info_service->get_characteristic(ESP_GATT_UUID_MANU_NAME);
-    this->schedule_read_char(manufacturer_char);
+    this->schedule_read_char(manufacturer_char, "MANU_NAME");
     BLECharacteristic *serial_number_char =
         device_info_service->get_characteristic(
             ESP_GATT_UUID_SERIAL_NUMBER_STR);
-    this->schedule_read_char(serial_number_char);
+    this->schedule_read_char(serial_number_char, "SERIAL_NUMBER");
   }
   if (hid_service != nullptr) {
     BLECharacteristic *hid_report_map_char =
         hid_service->get_characteristic(ESP_GATT_UUID_HID_REPORT_MAP);
-    this->schedule_read_char(hid_report_map_char);
+    this->schedule_read_char(hid_report_map_char, "HID_REPORT_MAP");
     ESP_LOGD(TAG, "Found %d characteristics",
              hid_service->characteristics.size());
     for (auto *chr : hid_service->characteristics) {
@@ -94,13 +119,20 @@ void BLEClientHID::read_client_characteristics() {
         continue;
       }
 
+      bool has_notify = (chr->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0;
       BLEDescriptor *rpt_ref_desc =
           chr->get_descriptor(ESP_GATT_UUID_RPT_REF_DESCR);
+      ESP_LOGD(TAG, "  HID_REPORT char handle=0x%04X props=0x%02X notify=%s rpt_ref=%s",
+               chr->handle, chr->properties,
+               has_notify ? "yes" : "no",
+               rpt_ref_desc != nullptr ? "yes" : "no");
+
       if (rpt_ref_desc != nullptr) {
         if (esp_ble_gattc_read_char_descr(
                 this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
                 rpt_ref_desc->handle, ESP_GATT_AUTH_REQ_NO_MITM) != ESP_OK) {
-          ESP_LOGW(TAG, "scheduling reading of RPT_REF_DESCR failed.");
+          ESP_LOGW(TAG, "scheduling reading of RPT_REF_DESCR failed for handle 0x%04X.",
+                   chr->handle);
         }
         this->handles_to_read.insert(
             std::make_pair(rpt_ref_desc->handle, nullptr));
@@ -225,11 +257,30 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
 }
 
 void BLEClientHID::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
-  ESP_LOGD(TAG, "Received HID input report from handle %d",
-           p_data->notify.handle);
+  // Determine report_id from our mapping (avoid default-entry creation via [])
+  uint8_t report_id = 0;
+  if (this->handle_report_id.count(p_data->notify.handle) > 0) {
+    report_id = this->handle_report_id.at(p_data->notify.handle);
+  } else {
+    ESP_LOGW(TAG, "No report_id mapping for notify handle 0x%04X, defaulting to 0",
+             p_data->notify.handle);
+  }
+
+  // Log raw notify payload in hex for diagnostics
+  if (p_data->notify.value_len > 0) {
+    std::string hex;
+    char byte_str[5];
+    for (uint16_t i = 0; i < p_data->notify.value_len; i++) {
+      snprintf(byte_str, sizeof(byte_str), "%02X ", p_data->notify.value[i]);
+      hex += byte_str;
+    }
+    ESP_LOGD(TAG, "HID notify: handle=0x%04X report_id=%d len=%d data=[%s]",
+             p_data->notify.handle, report_id, p_data->notify.value_len, hex.c_str());
+  }
+
   uint8_t *data = new uint8_t[p_data->notify.value_len + 1];
   memcpy(data + 1, p_data->notify.value, p_data->notify.value_len);
-  data[0] = this->handle_report_id[p_data->notify.handle];
+  data[0] = report_id;
   std::vector<HIDReportItemValue> hid_report_values =
       this->hid_report_map->parse(data);
   if (hid_report_values.size() == 0) {
@@ -241,9 +292,13 @@ void BLEClientHID::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
     if (USAGE_PAGES.count(value.usage.page) > 0 &&
         USAGE_PAGES.at(value.usage.page).usages_.count(value.usage.usage) > 0) {
       usage = USAGE_PAGES.at(value.usage.page).usages_.at(value.usage.usage);
+      ESP_LOGD(TAG, "HID event: page=0x%02X usage=0x%04X value=%d name='%s'",
+               value.usage.page, value.usage.usage, value.value, usage.c_str());
     } else {
       usage = std::to_string(value.usage.page) + "_" +
               std::to_string(value.usage.usage);
+      ESP_LOGD(TAG, "HID event: page=0x%02X usage=0x%04X value=%d (unknown usage, fallback='%s')",
+               value.usage.page, value.usage.usage, value.value, usage.c_str());
     }
     #ifdef USE_API
     this->fire_homeassistant_event("esphome.hid_events", {{"usage", usage}, {"value", std::to_string(value.value)}});
@@ -287,19 +342,26 @@ void BLEClientHID::register_last_event_code_text_sensor(
 }
 
 void BLEClientHID::schedule_read_char(
-    ble_client::BLECharacteristic *characteristic) {
-  if (characteristic != nullptr &&
-      ((characteristic->properties & ESP_GATT_CHAR_PROP_BIT_READ) != 0)) {
-    if (esp_ble_gattc_read_char(
-            this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
-            characteristic->handle, ESP_GATT_AUTH_REQ_NO_MITM) != ESP_OK) {
-      ESP_LOGW(TAG, "read_char failed");
-    }
-    this->handles_to_read.insert(
-        std::make_pair(characteristic->handle, nullptr));
+    ble_client::BLECharacteristic *characteristic, const char *name) {
+  if (characteristic == nullptr) {
+    ESP_LOGW(TAG, "Characteristic '%s': not found on device (nullptr)", name);
     return;
   }
-  ESP_LOGW(TAG, "characteristic not found");
+  if ((characteristic->properties & ESP_GATT_CHAR_PROP_BIT_READ) == 0) {
+    ESP_LOGW(TAG,
+             "Characteristic '%s' (handle=0x%04X): exists but READ property "
+             "not set (properties=0x%02X)",
+             name, characteristic->handle, characteristic->properties);
+    return;
+  }
+  if (esp_ble_gattc_read_char(
+          this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
+          characteristic->handle, ESP_GATT_AUTH_REQ_NO_MITM) != ESP_OK) {
+    ESP_LOGW(TAG, "read_char failed for '%s' (handle=0x%04X)",
+             name, characteristic->handle);
+  }
+  this->handles_to_read.insert(
+      std::make_pair(characteristic->handle, nullptr));
 }
 
 uint8_t *BLEClientHID::parse_characteristic_data(
@@ -310,13 +372,14 @@ uint8_t *BLEClientHID::parse_characteristic_data(
     ESP_LOGD(TAG, "No characteristic with uuid %#X found on device", uuid);
     return nullptr;
   }
-  if (handles_to_read.count(characteristic->handle) >= 1) {
+  if (handles_to_read.count(characteristic->handle) >= 1 &&
+      handles_to_read.at(characteristic->handle) != nullptr) {
     ESP_LOGD(
         TAG,
         "Characteristic parsed for uuid %#X and handle %#X starts with %#X",
         uuid, characteristic->handle,
-        *(handles_to_read[characteristic->handle]->value_));
-    return handles_to_read[characteristic->handle]->value_;
+        *(handles_to_read.at(characteristic->handle)->value_));
+    return handles_to_read.at(characteristic->handle)->value_;
   }
   ESP_LOGD(TAG,
            "Characteristic with uuid %#X and handle %#X not stored in "
@@ -365,12 +428,20 @@ void BLEClientHID::configure_hid_client() {
   if (device_info_service != nullptr) {
     BLECharacteristic *pnp_id_char =
         device_info_service->get_characteristic(ESP_GATT_UUID_PNP_ID);
-    uint8_t *rdata = this->handles_to_read[pnp_id_char->handle]->value_;
-    this->vendor_id = *((uint16_t *)&rdata[1]);
-    this->product_id = *((uint16_t *)&rdata[3]);
-    this->version = *((uint16_t *)&rdata[5]);
-    delete this->handles_to_read[pnp_id_char->handle];
-    this->handles_to_read.erase(pnp_id_char->handle);
+    if (pnp_id_char != nullptr &&
+        this->handles_to_read.count(pnp_id_char->handle) > 0 &&
+        this->handles_to_read.at(pnp_id_char->handle) != nullptr) {
+      uint8_t *rdata = this->handles_to_read.at(pnp_id_char->handle)->value_;
+      this->vendor_id = *((uint16_t *)&rdata[1]);
+      this->product_id = *((uint16_t *)&rdata[3]);
+      this->version = *((uint16_t *)&rdata[5]);
+      ESP_LOGD(TAG, "PNP ID: vendor=0x%04X product=0x%04X version=0x%04X",
+               this->vendor_id, this->product_id, this->version);
+      delete this->handles_to_read.at(pnp_id_char->handle);
+      this->handles_to_read.erase(pnp_id_char->handle);
+    } else {
+      ESP_LOGW(TAG, "PNP ID characteristic not available or not read");
+    }
 
     uint8_t *t_manufacturer = this->parse_characteristic_data(
         device_info_service, ESP_GATT_UUID_MANU_NAME);
@@ -391,24 +462,32 @@ void BLEClientHID::configure_hid_client() {
   if (hid_service != nullptr) {
     BLECharacteristic *hid_report_map_char =
         hid_service->get_characteristic(ESP_GATT_UUID_HID_REPORT_MAP);
-    ESP_LOGD(TAG, "Parse HID Report Map");
-    HIDReportMap::esp_logd_report_map(
-        this->handles_to_read[hid_report_map_char->handle]->value_,
-        this->handles_to_read[hid_report_map_char->handle]->value_len_);
-    this->hid_report_map = HIDReportMap::parse_report_map_data(
-        this->handles_to_read[hid_report_map_char->handle]->value_,
-        this->handles_to_read[hid_report_map_char->handle]->value_len_);
-    ESP_LOGD(TAG, "Parse HID Report Map Done");
+    if (hid_report_map_char != nullptr &&
+        this->handles_to_read.count(hid_report_map_char->handle) > 0 &&
+        this->handles_to_read.at(hid_report_map_char->handle) != nullptr) {
+      ESP_LOGD(TAG, "Parse HID Report Map");
+      HIDReportMap::esp_logd_report_map(
+          this->handles_to_read.at(hid_report_map_char->handle)->value_,
+          this->handles_to_read.at(hid_report_map_char->handle)->value_len_);
+      this->hid_report_map = HIDReportMap::parse_report_map_data(
+          this->handles_to_read.at(hid_report_map_char->handle)->value_,
+          this->handles_to_read.at(hid_report_map_char->handle)->value_len_);
+      ESP_LOGD(TAG, "Parse HID Report Map Done");
+    } else {
+      ESP_LOGW(TAG, "HID_REPORT_MAP characteristic not available or not read");
+    }
     std::vector<BLECharacteristic *> chars = hid_service->characteristics;
     for (BLECharacteristic *hid_char : chars) {
       if (hid_char->uuid.get_uuid().uuid.uuid16 == ESP_GATT_UUID_HID_REPORT) {
         if (hid_char->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) {
+          ESP_LOGD(TAG, "HID_REPORT char handle=0x%04X: registering for notify",
+                   hid_char->handle);
           auto status = esp_ble_gattc_register_for_notify(
               this->parent()->get_gattc_if(), this->parent()->get_remote_bda(),
               hid_char->handle);
           if (status != ESP_OK) {
             ESP_LOGW(TAG,
-                     "Register for notify failed for handle %d with status=%d",
+                     "Register for notify failed for handle 0x%04X with status=%d",
                      hid_char->handle, status);
           } else {
             this->handles_waiting_for_notify_registration++;
@@ -416,12 +495,21 @@ void BLEClientHID::configure_hid_client() {
         }
         BLEDescriptor *rpt_ref_desc =
             hid_char->get_descriptor(ESP_GATT_UUID_RPT_REF_DESCR);
-        if (rpt_ref_desc != nullptr) {
-          handle_report_id.insert(std::make_pair(
-              hid_char->handle,
-              this->handles_to_read[rpt_ref_desc->handle]->value_[0]));
-          ESP_LOGD(TAG, "Report ID for handle %d is %d", hid_char->handle,
-                   this->handles_to_read[rpt_ref_desc->handle]->value_[0]);
+        if (rpt_ref_desc != nullptr &&
+            this->handles_to_read.count(rpt_ref_desc->handle) > 0 &&
+            this->handles_to_read.at(rpt_ref_desc->handle) != nullptr) {
+          uint8_t report_id = this->handles_to_read.at(rpt_ref_desc->handle)->value_[0];
+          uint8_t report_type = this->handles_to_read.at(rpt_ref_desc->handle)->value_len_ > 1
+                                    ? this->handles_to_read.at(rpt_ref_desc->handle)->value_[1]
+                                    : 0;
+          handle_report_id.insert(std::make_pair(hid_char->handle, report_id));
+          ESP_LOGD(TAG, "HID_REPORT char handle=0x%04X: report_id=%d report_type=%d",
+                   hid_char->handle, report_id, report_type);
+        } else {
+          ESP_LOGD(TAG,
+                   "HID_REPORT char handle=0x%04X: no RPT_REF_DESCR data, "
+                   "report_id will default to 0",
+                   hid_char->handle);
         }
       }
     }

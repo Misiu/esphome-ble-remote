@@ -347,9 +347,14 @@ namespace esphome
       }
       if (this->input_reports.count(0) == 0)
       {
-        ESP_LOGD(TAG, "Parsing HID report with report ID (%d)", hid_report_data[0]);
         uint8_t report_id = hid_report_data[0];
+        ESP_LOGD(TAG, "Parsing HID report with report ID (%d)", report_id);
         hid_report_data++;
+        if (this->input_reports.count(report_id) == 0)
+        {
+          ESP_LOGW(TAG, "Unknown report ID %d — no matching input report in map", report_id);
+          return std::vector<HIDReportItemValue>();
+        }
         return this->input_reports.at(report_id)->parse(hid_report_data);
       }
       ESP_LOGD(TAG, "Parsing HID report without report ID");
