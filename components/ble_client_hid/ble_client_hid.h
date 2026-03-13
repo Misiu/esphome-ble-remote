@@ -85,7 +85,7 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
  protected:
   void send_input_report_event(esp_ble_gattc_cb_param_t *p_data);
   uint8_t *parse_characteristic_data(ble_client::BLEService *service, uint16_t uuid);
-  HIDReportMap* hid_report_map;
+  HIDReportMap* hid_report_map = nullptr;
   std::vector<ble_client::BLECharacteristic *> characteristics;
   std::vector<uint16_t> handles_registered_for_notify;
   std::map<uint16_t, GATTReadData *> handles_to_read;
@@ -95,7 +95,7 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   sensor::Sensor *last_event_value_sensor = nullptr;
   sensor::Sensor *battery_sensor = nullptr;
   HIDState hid_state = HIDState::INIT;
-  uint16_t battery_handle;
+  uint16_t battery_handle = 0;
   uint16_t vendor_id;
   uint16_t product_id;
   uint16_t version;
@@ -105,6 +105,11 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   bool is_connected = false;
   uint8_t handles_waiting_for_notify_registration = 0;
   esp_ble_conn_update_params_t preferred_conn_params = {0};
+  // Keepalive: periodically read a characteristic to prevent the remote from
+  // self-disconnecting after an idle timeout (BLE HCI reason 0x13).
+  static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 120000;  // 2 minutes
+  uint16_t keepalive_char_handle_ = 0;
+  uint32_t last_keepalive_ms_ = 0;
 };
 
 }  // namespace ble_client_hid

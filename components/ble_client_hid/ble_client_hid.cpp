@@ -27,6 +27,23 @@ void BLEClientHID::loop() {
     case HIDState::NOTIFICATIONS_REGISTERED:
       esp_ble_gap_update_conn_params(&this->preferred_conn_params);
       this->hid_state = HIDState::CONN_PARAMS_UPDATING;
+      break;
+    case HIDState::CONFIGURED: {
+      // Periodic keepalive: read a characteristic to prevent the remote from
+      // self-disconnecting after an idle timeout (reason 0x13).
+      uint32_t now = millis();
+      if (this->keepalive_char_handle_ != 0 &&
+          (now - this->last_keepalive_ms_) >= KEEPALIVE_INTERVAL_MS) {
+        this->last_keepalive_ms_ = now;
+        ESP_LOGD(TAG, "Keepalive: reading char handle=0x%04X",
+                 this->keepalive_char_handle_);
+        esp_ble_gattc_read_char(this->parent()->get_gattc_if(),
+                                this->parent()->get_conn_id(),
+                                this->keepalive_char_handle_,
+                                ESP_GATT_AUTH_REQ_NO_MITM);
+      }
+      break;
+    }
     default:
       break;
   }
@@ -46,6 +63,7 @@ void BLEClientHID::gap_event_handler(esp_gap_ble_cb_event_t event,
     ESP_LOGI(TAG, "Updated conn params to interval=%.2f ms, latency=%u, timeout=%.1f ms", param->update_conn_params.conn_int * 1.25f, param->update_conn_params.latency, param->update_conn_params.timeout * 10.f);
     this->hid_state = HIDState::CONFIGURED;
     this->node_state = espbt::ClientState::ESTABLISHED;
+    this->last_keepalive_ms_ = millis();
     /* code */
      break;
    default:
@@ -96,6 +114,11 @@ void BLEClientHID::read_client_characteristics() {
     BLECharacteristic *pref_conn_params_char = generic_access_service->get_characteristic(ESP_GATT_UUID_GAP_PREF_CONN_PARAM);
     this->schedule_read_char(pref_conn_params_char, "GAP_PREF_CONN_PARAM");
     this->schedule_read_char(device_name_char, "GAP_DEVICE_NAME");
+    // Save device name handle as keepalive fallback (always readable).
+    if (device_name_char != nullptr &&
+        (device_name_char->properties & ESP_GATT_CHAR_PROP_BIT_READ) != 0) {
+      this->keepalive_char_handle_ = device_name_char->handle;
+    }
   }
   if (device_info_service != nullptr) {
     BLECharacteristic *pnp_id_char =
@@ -144,9 +167,14 @@ void BLEClientHID::read_client_characteristics() {
 void BLEClientHID::on_gatt_read_finished(GATTReadData *data) {
   std::map<uint16_t, GATTReadData *>::iterator itr;
   itr = this->handles_to_read.find(data->handle_);
-  if (itr != this->handles_to_read.end()) {
-    itr->second = data;
+  // Guard: if this handle is not in the tracked map (e.g. a keepalive read
+  // that fired while fully configured), discard the data and return without
+  // touching the state machine.
+  if (itr == this->handles_to_read.end()) {
+    delete data;
+    return;
   }
+  itr->second = data;
   // check if all handles have been read:
   for (auto const &element : this->handles_to_read) {
     if (element.second == nullptr) {
@@ -182,7 +210,20 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
     case ESP_GATTC_DISCONNECT_EVT: {
       ESP_LOGW(TAG, "[%s] Disconnected!",
                this->parent()->address_str());
-      this->status_set_warning("Diconnected");
+      this->status_set_warning("Disconnected");
+      // Reset all HID state so reconnection starts cleanly.
+      this->hid_state = HIDState::INIT;
+      this->handles_waiting_for_notify_registration = 0;
+      this->keepalive_char_handle_ = 0;
+      this->last_keepalive_ms_ = 0;
+      for (auto &kv : this->handles_to_read) {
+        delete kv.second;
+      }
+      this->handles_to_read.clear();
+      this->handle_report_id.clear();
+      this->handles_registered_for_notify.clear();
+      delete this->hid_report_map;
+      this->hid_report_map = nullptr;
       break;
     }
     case ESP_GATTC_SEARCH_RES_EVT: {
@@ -224,6 +265,15 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
                  param->read.status);
         break;
       }
+      // All code below runs only for successful reads.
+      // Update battery sensor whenever a battery char read completes
+      // (covers both keepalive reads and notify-driven initial reads).
+      if (event == ESP_GATTC_READ_CHAR_EVT &&
+          param->read.handle == this->battery_handle &&
+          param->read.value_len > 0 &&
+          this->battery_sensor != nullptr) {
+        this->battery_sensor->publish_state(param->read.value[0]);
+      }
       GATTReadData *data = new GATTReadData(
           param->read.handle, param->read.value, param->read.value_len);
       this->on_gatt_read_finished(data);
@@ -261,6 +311,10 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
 }
 
 void BLEClientHID::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
+  if (this->hid_report_map == nullptr) {
+    ESP_LOGW(TAG, "HID report received but report map not yet initialized, dropping");
+    return;
+  }
   // Determine report_id from our mapping (avoid default-entry creation via [])
   uint8_t report_id = 0;
   if (this->handle_report_id.count(p_data->notify.handle) > 0) {
@@ -428,6 +482,11 @@ void BLEClientHID::configure_hid_client() {
         this->handles_waiting_for_notify_registration++;
       }
     }
+    // Prefer battery char for keepalive reads (also readable when no NOTIFY).
+    if (battery_level_char != nullptr &&
+        (battery_level_char->properties & ESP_GATT_CHAR_PROP_BIT_READ) != 0) {
+      this->keepalive_char_handle_ = battery_level_char->handle;
+    }
   }
   if (device_info_service != nullptr) {
     BLECharacteristic *pnp_id_char =
@@ -473,6 +532,7 @@ void BLEClientHID::configure_hid_client() {
       HIDReportMap::esp_logd_report_map(
           this->handles_to_read.at(hid_report_map_char->handle)->value_,
           this->handles_to_read.at(hid_report_map_char->handle)->value_len_);
+      delete this->hid_report_map;
       this->hid_report_map = HIDReportMap::parse_report_map_data(
           this->handles_to_read.at(hid_report_map_char->handle)->value_,
           this->handles_to_read.at(hid_report_map_char->handle)->value_len_);
