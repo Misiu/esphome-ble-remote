@@ -25,8 +25,17 @@ void BLEClientHID::loop() {
       this->hid_state = HIDState::NOTIFICATIONS_REGISTERING;
       break;
     case HIDState::NOTIFICATIONS_REGISTERED:
-      esp_ble_gap_update_conn_params(&this->preferred_conn_params);
-      this->hid_state = HIDState::CONN_PARAMS_UPDATING;
+      // Update connection parameters per device's preference.  This is
+      // fire-and-forget — we do NOT block on the GAP event because that
+      // event may never fire (remote rejects update, event is for another
+      // device, etc.).  Move to CONFIGURED immediately so the keepalive
+      // loop runs regardless.
+      if (this->preferred_conn_params.max_int > 0) {
+        esp_ble_gap_update_conn_params(&this->preferred_conn_params);
+      }
+      this->hid_state = HIDState::CONFIGURED;
+      this->node_state = espbt::ClientState::ESTABLISHED;
+      this->last_keepalive_ms_ = millis();
       break;
     case HIDState::CONFIGURED: {
       // Periodic keepalive: read a characteristic to prevent the remote from
@@ -60,11 +69,10 @@ void BLEClientHID::gap_event_handler(esp_gap_ble_cb_event_t event,
    switch (event)
    {
    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+    // Validate BDA so we don't react to updates for other connected devices.
+    if (memcmp(param->update_conn_params.bda, this->parent()->get_remote_bda(), 6) != 0)
+      break;
     ESP_LOGI(TAG, "Updated conn params to interval=%.2f ms, latency=%u, timeout=%.1f ms", param->update_conn_params.conn_int * 1.25f, param->update_conn_params.latency, param->update_conn_params.timeout * 10.f);
-    this->hid_state = HIDState::CONFIGURED;
-    this->node_state = espbt::ClientState::ESTABLISHED;
-    this->last_keepalive_ms_ = millis();
-    /* code */
      break;
    default:
      break;

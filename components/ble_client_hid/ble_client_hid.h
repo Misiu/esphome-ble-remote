@@ -107,7 +107,7 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   esp_ble_conn_update_params_t preferred_conn_params = {0};
   // Keepalive: periodically read a characteristic to prevent the remote from
   // self-disconnecting after an idle timeout (BLE HCI reason 0x13).
-  static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 120000;  // 2 minutes
+  static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 90000;  // 90 seconds
   uint16_t keepalive_char_handle_ = 0;
   uint32_t last_keepalive_ms_ = 0;
 };
