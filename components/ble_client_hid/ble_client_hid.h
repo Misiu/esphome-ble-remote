@@ -105,15 +105,24 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   bool is_connected = false;
   uint8_t handles_waiting_for_notify_registration = 0;
   esp_ble_conn_update_params_t preferred_conn_params = {0};
-  // Keepalive: periodically issue a GATT read of a static characteristic
-  // (Battery Level or HID Information) to reset the remote's idle timer at
-  // the GATT layer, without touching HID power-management state (which would
-  // suppress the remote's button-press LED).  Falls back to HID Control
-  // Point write if no readable characteristic is available, and finally to a
-  // connection-parameter update as a last resort.
+  // Keepalive: every KEEPALIVE_INTERVAL_MS, write "Exit Suspend" (0x01) then
+  // immediately "Suspend" (0x00) to the HID Control Point characteristic.
+  //
+  // Exit Suspend resets the remote's application-level idle timer (preventing
+  // the 5-minute HCI reason-0x13 self-disconnect).  Immediately writing
+  // Suspend afterwards returns the device to suspend mode so that the next
+  // button press triggers its LED feedback (the remote flashes the LED when
+  // it wakes from suspend to deliver a HID report to the host).
+  //
+  // Both writes use Write Without Response (ESP_GATT_WRITE_TYPE_NO_RSP).
+  // This is critical: GATT reads (used previously) require the remote to send
+  // an ATT Read Response.  If the BLE connection drops while a read is in
+  // flight, the remote is left with a queued but undelivered response.  When
+  // a new connection arrives the remote's GATT stack is in an inconsistent
+  // state and crashes (requiring a battery pull to recover).  Write Without
+  // Response has no such pending-state problem.
   static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 90000;  // 90 seconds
-  uint16_t keepalive_read_handle_ = 0;   // primary: GATT read
-  uint16_t hid_control_point_handle_ = 0;  // fallback: GATT write
+  uint16_t hid_control_point_handle_ = 0;  // HID CP for keepalive writes
   uint32_t last_keepalive_ms_ = 0;
 };
 

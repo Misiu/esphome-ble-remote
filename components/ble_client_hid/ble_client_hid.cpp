@@ -13,10 +13,6 @@ static const std::string EMPTY = "";
 
 static TickType_t last_run = 0;
 
-// HID Information characteristic UUID (0x2A4A) — standard GATT, read-only,
-// used as keepalive read target when battery level is unavailable.
-static constexpr uint16_t UUID_HID_INFORMATION = 0x2A4A;
-
 // Maximum connection latency we will accept/request.
 // With max_int=16 (20 ms × 1.25), effective wake interval =
 //   20 ms × (MAX_CONN_LATENCY + 1) = 200 ms.
@@ -81,61 +77,81 @@ void BLEClientHID::loop() {
       this->node_state = espbt::ClientState::ESTABLISHED;
       this->last_keepalive_ms_ = millis();
       ESP_LOGI(TAG, "[state] CONFIGURED — device ready. "
-               "keepalive_read=0x%04X  hid_cp=0x%04X  preferred_latency=%u",
-               this->keepalive_read_handle_, this->hid_control_point_handle_,
+               "hid_cp=0x%04X  preferred_latency=%u",
+               this->hid_control_point_handle_,
                this->preferred_conn_params.latency);
       break;
     case HIDState::CONFIGURED: {
       // Periodic keepalive to prevent the remote from self-disconnecting after
       // its application-level idle timeout (HCI reason 0x13).
       //
-      // Strategy (in priority order):
-      //  1. GATT read of a static characteristic (Battery Level or HID Info).
-      //     Resets the remote's GATT-layer idle timer WITHOUT changing its HID
-      //     power-management state.  Writing to HID Control Point ("Exit
-      //     Suspend") also resets the timer but can suppress the remote's
-      //     button-press LED — so we avoid it as a periodic keepalive.
-      //  2. HID Control Point write — only when no readable char is found.
-      //  3. Connection-parameter update (L2CAP only) — last resort.
+      // Strategy:
+      //  PRIMARY: Write HID Control Point Exit Suspend (0x01) then immediately
+      //  Suspend (0x00).  This uses Write Without Response — the remote does NOT
+      //  need to send an ATT response, so there is NO pending GATT state left in
+      //  the remote's stack if the connection drops mid-keepalive.  A pending
+      //  GATT-read response (left over from GATT read keepalives) was the root
+      //  cause of the remote crashing on reconnect — the remote's GATT stack was
+      //  stuck in a "response queued" state when a new connection arrived.
+      //
+      //  Writing Exit Suspend resets the remote's idle timer.  Immediately
+      //  following with Suspend puts the device back into suspend mode so that
+      //  the next button press causes the expected LED flash (the LED fires when
+      //  the device wakes from suspend to deliver the report).
+      //
+      //  FALLBACK: connection-parameter update (L2CAP only — last resort, does
+      //  NOT reset idle timer but may help with supervision timeout survival).
       uint32_t now = millis();
       if ((now - this->last_keepalive_ms_) >= KEEPALIVE_INTERVAL_MS) {
         this->last_keepalive_ms_ = now;
-        if (this->keepalive_read_handle_ != 0) {
-          ESP_LOGI(TAG, "Keepalive: reading char handle=0x%04X "
-                   "(resets idle timer, preserves remote LED behavior)",
-                   this->keepalive_read_handle_);
-          esp_err_t err = esp_ble_gattc_read_char(
+        if (this->hid_control_point_handle_ != 0) {
+          // Step 1: Exit Suspend — signals host is active, resets idle timer.
+          uint8_t hid_exit_suspend_cmd = 0x01;
+          ESP_LOGI(TAG, "Keepalive: writing Exit Suspend (0x01) to HID CP 0x%04X",
+                   this->hid_control_point_handle_);
+          esp_err_t err = esp_ble_gattc_write_char(
               this->parent()->get_gattc_if(),
               this->parent()->get_conn_id(),
-              this->keepalive_read_handle_,
+              this->hid_control_point_handle_,
+              sizeof(hid_exit_suspend_cmd), &hid_exit_suspend_cmd,
+              ESP_GATT_WRITE_TYPE_NO_RSP,
               ESP_GATT_AUTH_REQ_NONE);
           if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Keepalive read failed (err=0x%x) — will retry next interval", err);
+            ESP_LOGW(TAG, "Keepalive: Exit Suspend write failed (err=0x%x)", err);
           }
-        } else if (this->hid_control_point_handle_ != 0) {
-          // NOTE: writing Exit Suspend every 90 s can suppress the remote's
-          // button-press LED on some devices (Remodo X confirmed).  Only used
-          // when there is no safe read characteristic.
-          uint8_t cmd = 0x01;  // Exit Suspend
-          ESP_LOGW(TAG, "Keepalive: writing HID Control Point 0x%04X "
-                   "(fallback — may suppress remote button-press LED)",
+          // Step 2: Suspend — returns device to suspend mode so the next button
+          // press triggers the remote's LED feedback.  Also Write Without
+          // Response, so no pending state if the connection drops between here
+          // and the next keepalive.
+          uint8_t hid_suspend_cmd = 0x00;
+          ESP_LOGD(TAG, "Keepalive: writing Suspend (0x00) to HID CP 0x%04X "
+                   "(restores suspend mode → LED will flash on next button press)",
                    this->hid_control_point_handle_);
-          esp_ble_gattc_write_char(this->parent()->get_gattc_if(),
-                                   this->parent()->get_conn_id(),
-                                   this->hid_control_point_handle_,
-                                   sizeof(cmd), &cmd,
-                                   ESP_GATT_WRITE_TYPE_NO_RSP,
-                                   ESP_GATT_AUTH_REQ_NONE);
+          err = esp_ble_gattc_write_char(
+              this->parent()->get_gattc_if(),
+              this->parent()->get_conn_id(),
+              this->hid_control_point_handle_,
+              sizeof(hid_suspend_cmd), &hid_suspend_cmd,
+              ESP_GATT_WRITE_TYPE_NO_RSP,
+              ESP_GATT_AUTH_REQ_NONE);
+          if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Keepalive: Suspend write failed (err=0x%x)", err);
+          }
         } else {
+          // No HID Control Point found — attempt a conn-param update to
+          // generate some link-layer traffic.  This does NOT reset the remote's
+          // application-level idle timer but may help keep the supervision
+          // timeout from firing.
           if (this->preferred_conn_params.max_int > 0) {
             esp_ble_conn_update_params_t p = this->preferred_conn_params;
             if (p.timeout < 800) p.timeout = 800;
             if (p.latency > MAX_CONN_LATENCY) p.latency = MAX_CONN_LATENCY;
-            ESP_LOGD(TAG, "Keepalive: conn param update (last resort — "
-                     "does NOT reset remote idle timer)");
+            ESP_LOGW(TAG, "Keepalive: no HID CP — conn param update only "
+                     "(idle disconnect after 5 min may still occur)");
             esp_ble_gap_update_conn_params(&p);
           } else {
-            ESP_LOGW(TAG, "Keepalive: no mechanism available — idle disconnect may occur");
+            ESP_LOGW(TAG, "Keepalive: no mechanism available — "
+                     "idle disconnect after 5 min of inactivity is expected");
           }
         }
       }
@@ -322,7 +338,6 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
       // Reset all HID state so reconnection starts cleanly.
       HIDState prev = this->hid_state;
       this->hid_state = HIDState::INIT;
-      this->keepalive_read_handle_ = 0;
       this->handles_waiting_for_notify_registration = 0;
       this->hid_control_point_handle_ = 0;
       this->last_keepalive_ms_ = 0;
@@ -635,16 +650,17 @@ void BLEClientHID::configure_hid_client() {
     if (battery_level_char != nullptr) {
       ESP_LOGD(TAG, "[configure] battery level char: handle=0x%04X props=0x%02X",
                battery_level_char->handle, battery_level_char->properties);
-      // Always store handle for keepalive reads (READ property is sufficient).
+      // Store handle for battery level tracking (notify + read for initial value).
+      // NOTE: We do NOT use battery level for periodic keepalive reads anymore.
+      // GATT reads leave a pending-response state in the remote's GATT stack;
+      // if the connection drops while a read is in flight, the remote's stack
+      // is stuck and crashes when a new connection arrives.  The keepalive uses
+      // HID Control Point Write-Without-Response instead (no pending state).
       if ((battery_level_char->properties & ESP_GATT_CHAR_PROP_BIT_READ) != 0) {
         this->battery_handle = battery_level_char->handle;
-        // Prefer battery level read as primary keepalive: safe GATT read that
-        // resets the remote's idle timer WITHOUT touching HID power-management
-        // state (unlike writing Exit Suspend to HID Control Point, which
-        // suppresses the remote's button-press LED on some devices).
-        this->keepalive_read_handle_ = battery_level_char->handle;
-        ESP_LOGI(TAG, "[configure] battery level handle=0x%04X → "
-                 "will use as keepalive read target", battery_level_char->handle);
+        ESP_LOGD(TAG, "[configure] battery level handle=0x%04X stored "
+                 "(for notify + on-demand reads; NOT used for keepalive)",
+                 battery_level_char->handle);
       }
       if ((battery_level_char->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0) {
         auto status = esp_ble_gattc_register_for_notify(
@@ -763,47 +779,34 @@ void BLEClientHID::configure_hid_client() {
         }
       }
     }
-    // Look for HID Control Point — used as keepalive ONLY when no readable
-    // characteristic is available (battery level, etc.).  Periodic writes of
-    // Exit Suspend (0x01) prevent the 5-minute idle disconnect but can
-    // suppress the remote's button-press LED on some devices.
+    // Look for HID Control Point — PRIMARY keepalive target.
+    // Write Without Response (no ATT acknowledgement needed from remote), so
+    // if the connection drops while a keepalive write is in flight there is NO
+    // pending response state left in the remote's GATT stack.  This is the key
+    // advantage over GATT reads: a pending GATT read-response that is never
+    // sent (because the connection dropped) leaves the remote in a confused
+    // state and can cause it to crash on reconnect.
     for (BLECharacteristic *hid_char : chars) {
       if (hid_char->uuid.get_uuid().uuid.uuid16 == ESP_GATT_UUID_HID_CONTROL_POINT &&
           (hid_char->properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) != 0) {
         this->hid_control_point_handle_ = hid_char->handle;
         ESP_LOGI(TAG, "[configure] HID Control Point handle=0x%04X found "
-                 "(fallback keepalive only — prefer read keepalive)",
-                 this->hid_control_point_handle_);
+                 "(primary keepalive: Exit Suspend + Suspend cycle every %u ms)",
+                 this->hid_control_point_handle_, KEEPALIVE_INTERVAL_MS);
         break;
       }
     }
     if (this->hid_control_point_handle_ == 0) {
-      ESP_LOGD(TAG, "[configure] HID Control Point not found");
-    }
-    // If no battery level char was found, try HID Information as keepalive
-    // read target (read-only static 4-byte characteristic, very safe).
-    if (this->keepalive_read_handle_ == 0) {
-      for (BLECharacteristic *hid_char : chars) {
-        if (hid_char->uuid.get_uuid().uuid.uuid16 == UUID_HID_INFORMATION &&
-            (hid_char->properties & ESP_GATT_CHAR_PROP_BIT_READ) != 0) {
-          this->keepalive_read_handle_ = hid_char->handle;
-          ESP_LOGI(TAG, "[configure] HID Information handle=0x%04X → "
-                   "will use as keepalive read target (battery not available)",
-                   this->keepalive_read_handle_);
-          break;
-        }
-      }
+      ESP_LOGW(TAG, "[configure] HID Control Point not found — "
+               "keepalive will fall back to conn param update (idle timeout may still occur)");
     }
   }
-  if (this->keepalive_read_handle_ == 0 && this->hid_control_point_handle_ == 0) {
+  if (this->hid_control_point_handle_ == 0) {
     ESP_LOGW(TAG, "[configure] no keepalive mechanism found — "
              "device may self-disconnect after idle timeout");
-  } else if (this->keepalive_read_handle_ != 0) {
-    ESP_LOGI(TAG, "[configure] keepalive: GATT read handle=0x%04X every %u ms",
-             this->keepalive_read_handle_, KEEPALIVE_INTERVAL_MS);
   } else {
-    ESP_LOGW(TAG, "[configure] keepalive: HID CP write handle=0x%04X every %u ms "
-             "(may suppress remote LED)",
+    ESP_LOGI(TAG, "[configure] keepalive: HID CP handle=0x%04X "
+             "Exit Suspend (0x01) + Suspend (0x00) every %u ms",
              this->hid_control_point_handle_, KEEPALIVE_INTERVAL_MS);
   }
   if (generic_access_service != nullptr) {
@@ -824,10 +827,9 @@ void BLEClientHID::configure_hid_client() {
     }
   }
   ESP_LOGD(TAG, "[configure] configure_hid_client() done: "
-           "notify_pending=%d report_map=%s keepalive_read=0x%04X hid_cp=0x%04X",
+           "notify_pending=%d report_map=%s hid_cp=0x%04X",
            this->handles_waiting_for_notify_registration,
            this->hid_report_map != nullptr ? "OK" : "MISSING",
-           this->keepalive_read_handle_,
            this->hid_control_point_handle_);
   // delete read data:
   for (auto &kv : this->handles_to_read) {
