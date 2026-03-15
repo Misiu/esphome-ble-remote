@@ -79,7 +79,6 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   void register_last_event_usage_text_sensor(text_sensor::TextSensor *last_event_usage_text_sensor);
   void register_last_event_code_text_sensor(text_sensor::TextSensor *last_event_code_text_sensor);
   void register_last_event_value_sensor(sensor::Sensor *last_event_value_sensor);
-  void register_battery_sensor(sensor::Sensor * battery_sensor);
   void configure_hid_client();
   
  protected:
@@ -93,16 +92,7 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   text_sensor::TextSensor *last_event_usage_text_sensor = nullptr;
   text_sensor::TextSensor *last_event_code_text_sensor = nullptr;
   sensor::Sensor *last_event_value_sensor = nullptr;
-  sensor::Sensor *battery_sensor = nullptr;
   HIDState hid_state = HIDState::INIT;
-  uint16_t battery_handle = 0;
-  uint16_t vendor_id;
-  uint16_t product_id;
-  uint16_t version;
-  std::string device_name;
-  std::string manufacturer;
-  std::string serial_number;
-  bool is_connected = false;
   uint8_t handles_waiting_for_notify_registration = 0;
   esp_ble_conn_update_params_t preferred_conn_params = {0};
   // Keepalive: every KEEPALIVE_INTERVAL_MS, write "Exit Suspend" (0x01) then

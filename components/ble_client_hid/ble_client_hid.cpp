@@ -186,11 +186,6 @@ void BLEClientHID::gap_event_handler(esp_gap_ble_cb_event_t event,
 void BLEClientHID::read_client_characteristics() {
   ESP_LOGD(TAG, "Reading client characteristics");
   using namespace ble_client;
-  BLEService *battery_service =
-      this->parent()->get_service(ESP_GATT_UUID_BATTERY_SERVICE_SVC);
-  BLEService *device_info_service =
-      this->parent()->get_service(ESP_GATT_UUID_DEVICE_INFO_SVC);
-
   BLEService *hid_service = this->parent()->get_service(ESP_GATT_UUID_HID_SVC);
   BLEService *generic_access_service = this->parent()->get_service(0x1800);
 
@@ -198,8 +193,6 @@ void BLEClientHID::read_client_characteristics() {
   ESP_LOGD(TAG, "=== GATT Services ===");
   struct { BLEService *svc; const char *name; } services[] = {
     {generic_access_service, "GenericAccess(0x1800)"},
-    {battery_service,        "Battery(0x180F)"},
-    {device_info_service,    "DeviceInfo(0x180A)"},
     {hid_service,            "HID(0x1812)"},
   };
   for (auto &entry : services) {
@@ -219,25 +212,13 @@ void BLEClientHID::read_client_characteristics() {
     }
   }
 
+  // Only read preferred connection parameters from Generic Access (0x1800).
+  // The Remodo X only advertises HID (0x1812); device info and device name
+  // are not present and would cause unnecessary failed GATT reads.
   if (generic_access_service != nullptr) {
-    BLECharacteristic *device_name_char =
-        generic_access_service->get_characteristic(
-            ESP_GATT_UUID_GAP_DEVICE_NAME);
-    BLECharacteristic *pref_conn_params_char = generic_access_service->get_characteristic(ESP_GATT_UUID_GAP_PREF_CONN_PARAM);
+    BLECharacteristic *pref_conn_params_char =
+        generic_access_service->get_characteristic(ESP_GATT_UUID_GAP_PREF_CONN_PARAM);
     this->schedule_read_char(pref_conn_params_char, "GAP_PREF_CONN_PARAM");
-    this->schedule_read_char(device_name_char, "GAP_DEVICE_NAME");
-  }
-  if (device_info_service != nullptr) {
-    BLECharacteristic *pnp_id_char =
-        device_info_service->get_characteristic(ESP_GATT_UUID_PNP_ID);
-    this->schedule_read_char(pnp_id_char, "PNP_ID");
-    BLECharacteristic *manufacturer_char =
-        device_info_service->get_characteristic(ESP_GATT_UUID_MANU_NAME);
-    this->schedule_read_char(manufacturer_char, "MANU_NAME");
-    BLECharacteristic *serial_number_char =
-        device_info_service->get_characteristic(
-            ESP_GATT_UUID_SERIAL_NUMBER_STR);
-    this->schedule_read_char(serial_number_char, "SERIAL_NUMBER");
   }
   if (hid_service != nullptr) {
     BLECharacteristic *hid_report_map_char =
@@ -341,7 +322,6 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
       this->handles_waiting_for_notify_registration = 0;
       this->hid_control_point_handle_ = 0;
       this->last_keepalive_ms_ = 0;
-      this->battery_handle = 0;
       for (auto &kv : this->handles_to_read) {
         delete kv.second;
       }
@@ -402,17 +382,6 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
       ESP_LOGD(TAG, "[gattc] READ_%s_EVT: handle=0x%04X len=%d OK",
                event == ESP_GATTC_READ_CHAR_EVT ? "CHAR" : "DESCR",
                param->read.handle, param->read.value_len);
-      // Update battery sensor whenever a battery char read completes
-      // (covers both keepalive reads and notify-driven initial reads).
-      if (event == ESP_GATTC_READ_CHAR_EVT &&
-          param->read.handle == this->battery_handle &&
-          param->read.value_len > 0) {
-        ESP_LOGI(TAG, "[gattc] READ_CHAR_EVT: battery level = %d%%",
-                 param->read.value[0]);
-        if (this->battery_sensor != nullptr) {
-          this->battery_sensor->publish_state(param->read.value[0]);
-        }
-      }
       GATTReadData *data = new GATTReadData(
           param->read.handle, param->read.value, param->read.value_len);
       this->on_gatt_read_finished(data);
@@ -431,20 +400,10 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
     }
     case ESP_GATTC_NOTIFY_EVT: {
       if (param->notify.conn_id != this->parent()->get_conn_id()) break;
-      if (p_data->notify.handle == this->battery_handle) {
-        if (p_data->notify.value_len > 0) {
-          uint8_t battery_level = p_data->notify.value[0];
-          ESP_LOGI(TAG, "[gattc] NOTIFY_EVT: battery level = %d%%", battery_level);
-          if (this->battery_sensor != nullptr) {
-            this->battery_sensor->publish_state(battery_level);
-          }
-        }
-      } else {
-        ESP_LOGD(TAG, "[gattc] NOTIFY_EVT: HID handle=0x%04X len=%d state=%s",
-                 p_data->notify.handle, p_data->notify.value_len,
-                 hid_state_name(this->hid_state));
-        this->send_input_report_event(p_data);
-      }
+      ESP_LOGD(TAG, "[gattc] NOTIFY_EVT: handle=0x%04X len=%d state=%s",
+               p_data->notify.handle, p_data->notify.value_len,
+               hid_state_name(this->hid_state));
+      this->send_input_report_event(p_data);
       break;
     }
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
@@ -563,10 +522,6 @@ void BLEClientHID::register_last_event_value_sensor(
   this->last_event_value_sensor = last_event_value_sensor;
 }
 
-void BLEClientHID::register_battery_sensor(sensor::Sensor *battery_sensor) {
-  this->battery_sensor = battery_sensor;
-}
-
 void BLEClientHID::register_last_event_usage_text_sensor(
     text_sensor::TextSensor *last_event_usage_text_sensor) {
   this->last_event_usage_text_sensor = last_event_usage_text_sensor;
@@ -627,99 +582,9 @@ uint8_t *BLEClientHID::parse_characteristic_data(
 void BLEClientHID::configure_hid_client() {
   using namespace ble_client;
   ESP_LOGD(TAG, "[configure] configure_hid_client() start");
-  BLEService *battery_service =
-      this->parent()->get_service(ESP_GATT_UUID_BATTERY_SERVICE_SVC);
-  BLEService *device_info_service =
-      this->parent()->get_service(ESP_GATT_UUID_DEVICE_INFO_SVC);
   BLEService *hid_service = this->parent()->get_service(ESP_GATT_UUID_HID_SVC);
   BLEService *generic_access_service = this->parent()->get_service(0x1800);
 
-  if (generic_access_service != nullptr) {
-    uint8_t *t_device_name = this->parse_characteristic_data(
-        generic_access_service, ESP_GATT_UUID_GAP_DEVICE_NAME);
-    if (t_device_name != nullptr) {
-      this->device_name = (const char *)t_device_name;
-    } else {
-      this->device_name = "Generic";
-    }
-    ESP_LOGD(TAG, "[configure] device name: '%s'", this->device_name.c_str());
-  }
-  if (battery_service != nullptr) {
-    BLECharacteristic *battery_level_char =
-        battery_service->get_characteristic(ESP_GATT_UUID_BATTERY_LEVEL);
-    if (battery_level_char != nullptr) {
-      ESP_LOGD(TAG, "[configure] battery level char: handle=0x%04X props=0x%02X",
-               battery_level_char->handle, battery_level_char->properties);
-      // Store handle for battery level tracking (notify + read for initial value).
-      // NOTE: We do NOT use battery level for periodic keepalive reads anymore.
-      // GATT reads leave a pending-response state in the remote's GATT stack;
-      // if the connection drops while a read is in flight, the remote's stack
-      // is stuck and crashes when a new connection arrives.  The keepalive uses
-      // HID Control Point Write-Without-Response instead (no pending state).
-      if ((battery_level_char->properties & ESP_GATT_CHAR_PROP_BIT_READ) != 0) {
-        this->battery_handle = battery_level_char->handle;
-        ESP_LOGD(TAG, "[configure] battery level handle=0x%04X stored "
-                 "(for notify + on-demand reads; NOT used for keepalive)",
-                 battery_level_char->handle);
-      }
-      if ((battery_level_char->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0) {
-        auto status = esp_ble_gattc_register_for_notify(
-            this->parent()->get_gattc_if(), this->parent()->get_remote_bda(),
-            battery_level_char->handle);
-        if (status != ESP_OK) {
-          ESP_LOGW(TAG, "[configure] register for notify failed for battery "
-                   "handle=0x%04X status=%d",
-                   battery_level_char->handle, status);
-        } else {
-          this->handles_waiting_for_notify_registration++;
-          ESP_LOGD(TAG, "[configure] registered for battery notify "
-                   "handle=0x%04X (pending=%d)",
-                   battery_level_char->handle,
-                   this->handles_waiting_for_notify_registration);
-        }
-      }
-    } else {
-      ESP_LOGD(TAG, "[configure] battery level characteristic not found");
-    }
-  } else {
-    ESP_LOGD(TAG, "[configure] battery service not present");
-  }
-  if (device_info_service != nullptr) {
-    BLECharacteristic *pnp_id_char =
-        device_info_service->get_characteristic(ESP_GATT_UUID_PNP_ID);
-    if (pnp_id_char != nullptr &&
-        this->handles_to_read.count(pnp_id_char->handle) > 0 &&
-        this->handles_to_read.at(pnp_id_char->handle) != nullptr) {
-      uint8_t *rdata = this->handles_to_read.at(pnp_id_char->handle)->value_;
-      this->vendor_id = *((uint16_t *)&rdata[1]);
-      this->product_id = *((uint16_t *)&rdata[3]);
-      this->version = *((uint16_t *)&rdata[5]);
-      ESP_LOGD(TAG, "[configure] PNP ID: vendor=0x%04X product=0x%04X version=0x%04X",
-               this->vendor_id, this->product_id, this->version);
-      delete this->handles_to_read.at(pnp_id_char->handle);
-      this->handles_to_read.erase(pnp_id_char->handle);
-    } else {
-      ESP_LOGW(TAG, "[configure] PNP ID characteristic not available or not read");
-    }
-
-    uint8_t *t_manufacturer = this->parse_characteristic_data(
-        device_info_service, ESP_GATT_UUID_MANU_NAME);
-    if (t_manufacturer != nullptr) {
-      this->manufacturer = (const char *)t_manufacturer;
-    } else {
-      this->manufacturer = "Generic";
-    }
-
-    uint8_t *t_serial = this->parse_characteristic_data(
-        device_info_service, ESP_GATT_UUID_SERIAL_NUMBER_STR);
-    if (t_serial != nullptr) {
-      this->serial_number = (const char *)t_serial;
-    } else {
-      this->serial_number = "000000";
-    }
-    ESP_LOGD(TAG, "[configure] device info: manufacturer='%s' serial='%s'",
-             this->manufacturer.c_str(), this->serial_number.c_str());
-  }
   if (hid_service != nullptr) {
     BLECharacteristic *hid_report_map_char =
         hid_service->get_characteristic(ESP_GATT_UUID_HID_REPORT_MAP);
