@@ -38,18 +38,34 @@ void BLEClientHID::loop() {
       this->last_keepalive_ms_ = millis();
       break;
     case HIDState::CONFIGURED: {
-      // Periodic keepalive: read a characteristic to prevent the remote from
-      // self-disconnecting after an idle timeout (reason 0x13).
+      // Periodic keepalive: send a BLE connection parameter update to the
+      // remote.  This generates L2CAP traffic that resets the remote's
+      // application-level idle timer and prevents reason-0x13 self-disconnect.
+      // A connection parameter update operates entirely below the GATT layer,
+      // so the remote's HID firmware never needs to wake up and handle it —
+      // avoiding the freeze seen when GATT reads were used as keepalives.
       uint32_t now = millis();
-      if (this->keepalive_char_handle_ != 0 &&
-          (now - this->last_keepalive_ms_) >= KEEPALIVE_INTERVAL_MS) {
+      if ((now - this->last_keepalive_ms_) >= KEEPALIVE_INTERVAL_MS) {
         this->last_keepalive_ms_ = now;
-        ESP_LOGD(TAG, "Keepalive: reading char handle=0x%04X",
-                 this->keepalive_char_handle_);
-        esp_ble_gattc_read_char(this->parent()->get_gattc_if(),
-                                this->parent()->get_conn_id(),
-                                this->keepalive_char_handle_,
-                                ESP_GATT_AUTH_REQ_NO_MITM);
+        if (this->preferred_conn_params.max_int > 0) {
+          ESP_LOGD(TAG, "Keepalive: sending conn param update");
+          esp_ble_gap_update_conn_params(&this->preferred_conn_params);
+        } else {
+          // No preferred params from device; fall back to current params so
+          // the update request still generates link-layer traffic.
+          esp_gap_conn_params_t cur = {0};
+          if (esp_ble_get_current_conn_params(
+                  this->parent()->get_remote_bda(), &cur) == ESP_OK) {
+            esp_ble_conn_update_params_t p = {0};
+            memcpy(p.bda, this->parent()->get_remote_bda(), ESP_BD_ADDR_LEN);
+            p.min_int = cur.interval;
+            p.max_int = cur.interval;
+            p.latency = cur.latency;
+            p.timeout = cur.timeout;
+            ESP_LOGD(TAG, "Keepalive: sending conn param update (current params)");
+            esp_ble_gap_update_conn_params(&p);
+          }
+        }
       }
       break;
     }
@@ -122,11 +138,6 @@ void BLEClientHID::read_client_characteristics() {
     BLECharacteristic *pref_conn_params_char = generic_access_service->get_characteristic(ESP_GATT_UUID_GAP_PREF_CONN_PARAM);
     this->schedule_read_char(pref_conn_params_char, "GAP_PREF_CONN_PARAM");
     this->schedule_read_char(device_name_char, "GAP_DEVICE_NAME");
-    // Save device name handle as keepalive fallback (always readable).
-    if (device_name_char != nullptr &&
-        (device_name_char->properties & ESP_GATT_CHAR_PROP_BIT_READ) != 0) {
-      this->keepalive_char_handle_ = device_name_char->handle;
-    }
   }
   if (device_info_service != nullptr) {
     BLECharacteristic *pnp_id_char =
@@ -222,7 +233,6 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
       // Reset all HID state so reconnection starts cleanly.
       this->hid_state = HIDState::INIT;
       this->handles_waiting_for_notify_registration = 0;
-      this->keepalive_char_handle_ = 0;
       this->last_keepalive_ms_ = 0;
       for (auto &kv : this->handles_to_read) {
         delete kv.second;
@@ -489,11 +499,6 @@ void BLEClientHID::configure_hid_client() {
       } else {
         this->handles_waiting_for_notify_registration++;
       }
-    }
-    // Prefer battery char for keepalive reads (also readable when no NOTIFY).
-    if (battery_level_char != nullptr &&
-        (battery_level_char->properties & ESP_GATT_CHAR_PROP_BIT_READ) != 0) {
-      this->keepalive_char_handle_ = battery_level_char->handle;
     }
   }
   if (device_info_service != nullptr) {
