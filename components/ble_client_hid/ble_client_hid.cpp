@@ -43,9 +43,11 @@ static const char *hid_state_name(HIDState s) {
 void BLEClientHID::loop() {
   switch (this->hid_state) {
     case HIDState::BLE_CONNECTED:
-      ESP_LOGD(TAG, "[state] BLE_CONNECTED → READING_CHARS: discovering characteristics");
-      this->read_client_characteristics();  // async; state advances to READ_CHARS
+      // Set READING_CHARS first so the fast-path inside read_client_characteristics()
+      // can immediately override it to READ_CHARS (reconnect with cached report map).
       this->hid_state = HIDState::READING_CHARS;
+      this->read_client_characteristics();
+      ESP_LOGI(TAG, "[state] BLE_CONNECTED → %s", hid_state_name(this->hid_state));
       break;
     case HIDState::READ_CHARS:
       ESP_LOGD(TAG, "[state] READ_CHARS → NOTIFICATIONS_REGISTERING: configuring HID client");
@@ -60,6 +62,8 @@ void BLEClientHID::loop() {
       // loop runs regardless.
       if (this->preferred_conn_params.max_int > 0) {
         esp_ble_conn_update_params_t p = this->preferred_conn_params;
+        // Always refresh BDA to the current connection's remote address.
+        memcpy(p.bda, this->parent()->get_remote_bda(), ESP_BD_ADDR_LEN);
         // Override supervision timeout to at least 8 s.  The remote asks for
         // 3 s; on an ESP32 sharing the 2.4 GHz radio with WiFi even a short
         // WiFi burst can cause consecutive BLE events to be missed.
@@ -184,7 +188,22 @@ void BLEClientHID::gap_event_handler(esp_gap_ble_cb_event_t event,
   }
 
 void BLEClientHID::read_client_characteristics() {
-  ESP_LOGD(TAG, "Reading client characteristics");
+  // Reconnect fast-path: if we already have the report map from a prior
+  // connection, skip ALL GATT reads.  The report map, handle→report_id
+  // mappings and preferred conn params are all static device properties that
+  // do not change between connections.  Issuing GATT reads (which require ATT
+  // Read Responses from the remote) can leave the remote's GATT stack in an
+  // inconsistent state if the connection drops mid-read — causing the remote to
+  // crash and require a battery pull on the next reconnect.  Skipping reads on
+  // reconnect eliminates this risk entirely.
+  if (this->hid_report_map != nullptr) {
+    ESP_LOGI(TAG, "[setup] Reconnect: using cached report map — "
+             "skipping all GATT reads, advancing directly to READ_CHARS");
+    this->hid_state = HIDState::READ_CHARS;
+    return;
+  }
+
+  ESP_LOGD(TAG, "[setup] First connection: scheduling GATT reads");
   using namespace ble_client;
   BLEService *hid_service = this->parent()->get_service(ESP_GATT_UUID_HID_SVC);
   BLEService *generic_access_service = this->parent()->get_service(0x1800);
@@ -326,10 +345,21 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
         delete kv.second;
       }
       this->handles_to_read.clear();
-      this->handle_report_id.clear();
       this->handles_registered_for_notify.clear();
-      delete this->hid_report_map;
-      this->hid_report_map = nullptr;
+      // Keep hid_report_map and handle_report_id across disconnects so that
+      // reconnects can skip all GATT reads.  Every GATT read (HID_REPORT_MAP,
+      // RPT_REF_DESCR, GAP_PREF_CONN_PARAM) requires an ATT Read Response from
+      // the remote.  If the connection drops while a read is in-flight the
+      // remote's GATT stack is left with a queued-but-never-delivered response.
+      // When a new connection arrives and new GATT operations start the remote
+      // hits this inconsistent state and crashes — requiring a battery pull.
+      // The report map and handle mappings are static properties of the device
+      // and never change, so caching them is correct.
+      if (this->hid_report_map != nullptr) {
+        ESP_LOGI(TAG, "[gattc] DISCONNECT_EVT: keeping cached report map + "
+                 "%zu handle→report_id mappings for reconnect (no GATT reads on reconnect)",
+                 this->handle_report_id.size());
+      }
       ESP_LOGD(TAG, "[gattc] DISCONNECT_EVT: was in state=%s, reset to INIT",
                hid_state_name(prev));
       break;
@@ -377,6 +407,25 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
         ESP_LOGW(TAG, "[gattc] READ_%s_EVT: handle=0x%04X FAILED status=0x%02X",
                  event == ESP_GATTC_READ_CHAR_EVT ? "CHAR" : "DESCR",
                  param->read.handle, param->read.status);
+        // If this was a pending setup read, erase it from the map so the state
+        // machine is not permanently stuck in READING_CHARS.  A failed read
+        // means we simply won't have that data (e.g. conn params), which is
+        // handled gracefully by the configure step.
+        auto it = this->handles_to_read.find(param->read.handle);
+        if (it != this->handles_to_read.end()) {
+          delete it->second;  // it->second may be nullptr if read was never fulfilled; delete nullptr is safe in C++
+          this->handles_to_read.erase(it);
+          // Check whether all remaining setup reads are now accounted for.
+          bool any_pending = false;
+          for (auto const &kv : this->handles_to_read) {
+            if (kv.second == nullptr) { any_pending = true; break; }
+          }
+          if (!any_pending) {
+            ESP_LOGW(TAG, "[gattc] READ_EVT: all setup reads accounted for "
+                     "(some failed) → READ_CHARS");
+            this->hid_state = HIDState::READ_CHARS;
+          }
+        }
         break;
       }
       ESP_LOGD(TAG, "[gattc] READ_%s_EVT: handle=0x%04X len=%d OK",
@@ -411,13 +460,24 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
         ESP_LOGW(TAG, "[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X FAILED status=0x%02X",
                  param->reg_for_notify.handle, param->reg_for_notify.status);
       } else {
-        ESP_LOGD(TAG, "[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X OK "
-                 "(remaining=%d)",
-                 param->reg_for_notify.handle,
-                 this->handles_waiting_for_notify_registration - 1);
+        ESP_LOGD(TAG, "[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X OK",
+                 param->reg_for_notify.handle);
+      }
+      // Guard against uint8_t underflow caused by stale callbacks firing after
+      // a disconnect (when the counter has already been reset to 0).
+      if (this->handles_waiting_for_notify_registration == 0) {
+        ESP_LOGW(TAG, "[gattc] REG_FOR_NOTIFY_EVT: spurious event "
+                 "(counter already 0, state=%s) — ignoring",
+                 hid_state_name(this->hid_state));
+        break;
       }
       this->handles_waiting_for_notify_registration--;
-      if (this->handles_waiting_for_notify_registration == 0) {
+      ESP_LOGD(TAG, "[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X remaining=%d",
+               param->reg_for_notify.handle,
+               this->handles_waiting_for_notify_registration);
+      // Only advance to NOTIFICATIONS_REGISTERED from the correct state.
+      if (this->handles_waiting_for_notify_registration == 0 &&
+          this->hid_state == HIDState::NOTIFICATIONS_REGISTERING) {
         ESP_LOGD(TAG, "[gattc] REG_FOR_NOTIFY_EVT: all notifications registered → "
                  "NOTIFICATIONS_REGISTERED");
         this->hid_state = HIDState::NOTIFICATIONS_REGISTERED;
@@ -600,8 +660,12 @@ void BLEClientHID::configure_hid_client() {
           this->handles_to_read.at(hid_report_map_char->handle)->value_,
           this->handles_to_read.at(hid_report_map_char->handle)->value_len_);
       ESP_LOGD(TAG, "[configure] HID Report Map parsed OK");
+    } else if (this->hid_report_map != nullptr) {
+      // Reconnect: report map cached from previous connection — no GATT read needed.
+      ESP_LOGI(TAG, "[configure] Using cached HID report map (reconnect)");
     } else {
-      ESP_LOGW(TAG, "[configure] HID_REPORT_MAP characteristic not available or not read");
+      ESP_LOGW(TAG, "[configure] HID_REPORT_MAP not available and no cached map — "
+               "button presses will be dropped");
     }
     std::vector<BLECharacteristic *> chars = hid_service->characteristics;
     ESP_LOGD(TAG, "[configure] HID service has %zu characteristics", chars.size());
@@ -637,6 +701,11 @@ void BLEClientHID::configure_hid_client() {
           ESP_LOGD(TAG, "[configure] HID_REPORT handle=0x%04X: "
                    "report_id=%d report_type=%d",
                    hid_char->handle, report_id, report_type);
+        } else if (this->handle_report_id.count(hid_char->handle) > 0) {
+          // Reconnect: use cached report_id mapping — no GATT descriptor read needed.
+          ESP_LOGD(TAG, "[configure] HID_REPORT handle=0x%04X: "
+                   "using cached report_id=%d",
+                   hid_char->handle, this->handle_report_id.at(hid_char->handle));
         } else {
           ESP_LOGD(TAG, "[configure] HID_REPORT handle=0x%04X: "
                    "no RPT_REF_DESCR data — report_id defaults to 0",
