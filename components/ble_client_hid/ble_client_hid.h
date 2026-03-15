@@ -105,12 +105,15 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   bool is_connected = false;
   uint8_t handles_waiting_for_notify_registration = 0;
   esp_ble_conn_update_params_t preferred_conn_params = {0};
-  // Keepalive: periodically send a Write Without Response to the HID Control
-  // Point to reset the remote's application-level idle timer and prevent
-  // reason-0x13 self-disconnect.  Falls back to a conn param update for
-  // devices that lack a HID Control Point characteristic.
+  // Keepalive: periodically issue a GATT read of a static characteristic
+  // (Battery Level or HID Information) to reset the remote's idle timer at
+  // the GATT layer, without touching HID power-management state (which would
+  // suppress the remote's button-press LED).  Falls back to HID Control
+  // Point write if no readable characteristic is available, and finally to a
+  // connection-parameter update as a last resort.
   static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 90000;  // 90 seconds
-  uint16_t hid_control_point_handle_ = 0;
+  uint16_t keepalive_read_handle_ = 0;   // primary: GATT read
+  uint16_t hid_control_point_handle_ = 0;  // fallback: GATT write
   uint32_t last_keepalive_ms_ = 0;
 };
 
