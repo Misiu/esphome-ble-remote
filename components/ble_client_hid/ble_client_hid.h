@@ -105,10 +105,12 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   bool is_connected = false;
   uint8_t handles_waiting_for_notify_registration = 0;
   esp_ble_conn_update_params_t preferred_conn_params = {0};
-  // Keepalive: periodically send a BLE connection parameter update to
-  // prevent the remote from self-disconnecting after an idle timeout
-  // (BLE HCI reason 0x13). Uses L2CAP traffic only — never touches GATT.
+  // Keepalive: periodically send a Write Without Response to the HID Control
+  // Point to reset the remote's application-level idle timer and prevent
+  // reason-0x13 self-disconnect.  Falls back to a conn param update for
+  // devices that lack a HID Control Point characteristic.
   static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 90000;  // 90 seconds
+  uint16_t hid_control_point_handle_ = 0;
   uint32_t last_keepalive_ms_ = 0;
 };
 

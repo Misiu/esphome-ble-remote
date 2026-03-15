@@ -31,39 +31,62 @@ void BLEClientHID::loop() {
       // device, etc.).  Move to CONFIGURED immediately so the keepalive
       // loop runs regardless.
       if (this->preferred_conn_params.max_int > 0) {
-        esp_ble_gap_update_conn_params(&this->preferred_conn_params);
+        esp_ble_conn_update_params_t p = this->preferred_conn_params;
+        // The remote requested a supervision timeout of 3 s (300 × 10 ms).
+        // On an ESP32 that shares the 2.4 GHz radio with WiFi, a brief WiFi
+        // burst can cause several consecutive BLE connection events to be
+        // missed.  With latency=29 the effective wake interval is up to
+        // 600 ms, giving only 5 chances inside 3 s.  Override to at least
+        // 8 s to prevent spurious supervision-timeout disconnects.
+        if (p.timeout < 800) p.timeout = 800;
+        esp_ble_gap_update_conn_params(&p);
       }
       this->hid_state = HIDState::CONFIGURED;
       this->node_state = espbt::ClientState::ESTABLISHED;
       this->last_keepalive_ms_ = millis();
       break;
     case HIDState::CONFIGURED: {
-      // Periodic keepalive: send a BLE connection parameter update to the
-      // remote.  This generates L2CAP traffic that resets the remote's
-      // application-level idle timer and prevents reason-0x13 self-disconnect.
-      // A connection parameter update operates entirely below the GATT layer,
-      // so the remote's HID firmware never needs to wake up and handle it —
-      // avoiding the freeze seen when GATT reads were used as keepalives.
+      // Periodic keepalive: prevent the remote from self-disconnecting after
+      // its application-level idle timeout (HCI reason 0x13).
       uint32_t now = millis();
       if ((now - this->last_keepalive_ms_) >= KEEPALIVE_INTERVAL_MS) {
         this->last_keepalive_ms_ = now;
-        if (this->preferred_conn_params.max_int > 0) {
-          ESP_LOGD(TAG, "Keepalive: sending conn param update");
-          esp_ble_gap_update_conn_params(&this->preferred_conn_params);
+        if (this->hid_control_point_handle_ != 0) {
+          // Primary keepalive: write "Exit Suspend" (0x01) to the HID Control
+          // Point characteristic.  This is a Write Without Response — the
+          // remote does NOT need to send a reply, so there is no
+          // response-handler race condition (unlike GATT reads).  Writing to
+          // the HID Control Point reaches the remote's HID application layer
+          // and is guaranteed to reset its idle timer.
+          uint8_t cmd = 0x01;  // Exit Suspend
+          ESP_LOGI(TAG, "Keepalive: writing HID Control Point (Exit Suspend)");
+          esp_ble_gattc_write_char(this->parent()->get_gattc_if(),
+                                   this->parent()->get_conn_id(),
+                                   this->hid_control_point_handle_,
+                                   sizeof(cmd), &cmd,
+                                   ESP_GATT_WRITE_TYPE_NO_RSP,
+                                   ESP_GATT_AUTH_REQ_NONE);
         } else {
-          // No preferred params from device; fall back to current params so
-          // the update request still generates link-layer traffic.
-          esp_gap_conn_params_t cur = {0};
-          if (esp_ble_get_current_conn_params(
-                  this->parent()->get_remote_bda(), &cur) == ESP_OK) {
-            esp_ble_conn_update_params_t p = {0};
-            memcpy(p.bda, this->parent()->get_remote_bda(), ESP_BD_ADDR_LEN);
-            p.min_int = cur.interval;
-            p.max_int = cur.interval;
-            p.latency = cur.latency;
-            p.timeout = cur.timeout;
-            ESP_LOGD(TAG, "Keepalive: sending conn param update (current params)");
+          // Fallback for devices without HID Control Point: send a connection
+          // parameter update to generate L2CAP traffic.
+          if (this->preferred_conn_params.max_int > 0) {
+            esp_ble_conn_update_params_t p = this->preferred_conn_params;
+            if (p.timeout < 800) p.timeout = 800;
+            ESP_LOGD(TAG, "Keepalive: sending conn param update");
             esp_ble_gap_update_conn_params(&p);
+          } else {
+            esp_gap_conn_params_t cur = {0};
+            if (esp_ble_get_current_conn_params(
+                    this->parent()->get_remote_bda(), &cur) == ESP_OK) {
+              esp_ble_conn_update_params_t p = {0};
+              memcpy(p.bda, this->parent()->get_remote_bda(), ESP_BD_ADDR_LEN);
+              p.min_int = cur.interval;
+              p.max_int = cur.interval;
+              p.latency = cur.latency;
+              p.timeout = cur.timeout;
+              ESP_LOGD(TAG, "Keepalive: sending conn param update (current params)");
+              esp_ble_gap_update_conn_params(&p);
+            }
           }
         }
       }
@@ -233,6 +256,7 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event,
       // Reset all HID state so reconnection starts cleanly.
       this->hid_state = HIDState::INIT;
       this->handles_waiting_for_notify_registration = 0;
+      this->hid_control_point_handle_ = 0;
       this->last_keepalive_ms_ = 0;
       for (auto &kv : this->handles_to_read) {
         delete kv.second;
@@ -589,6 +613,24 @@ void BLEClientHID::configure_hid_client() {
                    hid_char->handle);
         }
       }
+    }
+    // Look for HID Control Point to use as keepalive target.
+    // Iterate characteristics directly (same pattern as the loop above) so
+    // that we find it even on devices where get_characteristic() may not
+    // resolve all UUIDs at this stage.
+    for (BLECharacteristic *hid_char : chars) {
+      if (hid_char->uuid.get_uuid().uuid.uuid16 == ESP_GATT_UUID_HID_CONTROL_POINT &&
+          (hid_char->properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) != 0) {
+        this->hid_control_point_handle_ = hid_char->handle;
+        ESP_LOGI(TAG, "HID Control Point handle=0x%04X found for keepalive",
+                 this->hid_control_point_handle_);
+        break;
+      }
+    }
+    if (this->hid_control_point_handle_ == 0) {
+      ESP_LOGD(TAG,
+               "HID Control Point not found; conn param update will be used "
+               "as keepalive fallback");
     }
   }
   if(generic_access_service != nullptr){
