@@ -35,10 +35,16 @@ void BLEClientHID::loop() {
         // The remote requested a supervision timeout of 3 s (300 × 10 ms).
         // On an ESP32 that shares the 2.4 GHz radio with WiFi, a brief WiFi
         // burst can cause several consecutive BLE connection events to be
-        // missed.  With latency=29 the effective wake interval is up to
-        // 600 ms, giving only 5 chances inside 3 s.  Override to at least
-        // 8 s to prevent spurious supervision-timeout disconnects.
+        // missed.  Override to at least 8 s to prevent spurious
+        // supervision-timeout disconnects.
         if (p.timeout < 800) p.timeout = 800;
+        // The remote requested latency=29 — the effective wake interval is
+        // interval × (latency+1) = up to 600 ms, giving only ~13 wakeup
+        // opportunities inside the 8 s timeout.  Under WiFi coexistence on
+        // the same 2.4 GHz radio, this is not enough.  Cap latency so the
+        // wake interval stays ≤ 200 ms (40+ opportunities per timeout),
+        // which is far more robust to WiFi traffic bursts.
+        if (p.latency > 9) p.latency = 9;
         esp_ble_gap_update_conn_params(&p);
       }
       this->hid_state = HIDState::CONFIGURED;
