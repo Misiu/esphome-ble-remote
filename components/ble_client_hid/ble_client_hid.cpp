@@ -50,9 +50,22 @@ void BLEClientHID::loop() {
       ESP_LOGI(TAG, "[state] BLE_CONNECTED → %s", hid_state_name(this->hid_state));
       break;
     case HIDState::READ_CHARS:
-      ESP_LOGD(TAG, "[state] READ_CHARS → NOTIFICATIONS_REGISTERING: configuring HID client");
+      ESP_LOGD(TAG, "[state] READ_CHARS → configuring HID client");
       this->configure_hid_client();
-      this->hid_state = HIDState::NOTIFICATIONS_REGISTERING;
+      // Advance to NOTIFICATIONS_REGISTERING.  If no notify handles were found
+      // (or all register_for_notify calls failed), the counter is already 0 and
+      // no REG_FOR_NOTIFY_EVT will ever fire — advance directly to
+      // NOTIFICATIONS_REGISTERED to avoid a permanent deadlock.
+      if (this->handles_waiting_for_notify_registration == 0) {
+        ESP_LOGW(TAG, "[state] no notify registrations pending after configure "
+                 "— advancing directly to NOTIFICATIONS_REGISTERED");
+        this->hid_state = HIDState::NOTIFICATIONS_REGISTERED;
+      } else {
+        ESP_LOGD(TAG, "[state] NOTIFICATIONS_REGISTERING: "
+                 "waiting for %d REG_FOR_NOTIFY_EVT callbacks",
+                 this->handles_waiting_for_notify_registration);
+        this->hid_state = HIDState::NOTIFICATIONS_REGISTERING;
+      }
       break;
     case HIDState::NOTIFICATIONS_REGISTERED:
       // Update connection parameters per device's preference.  This is
@@ -644,6 +657,7 @@ void BLEClientHID::configure_hid_client() {
   ESP_LOGD(TAG, "[configure] configure_hid_client() start");
   BLEService *hid_service = this->parent()->get_service(ESP_GATT_UUID_HID_SVC);
   BLEService *generic_access_service = this->parent()->get_service(0x1800);
+  int notify_chars = 0;  // count of notify-capable HID_REPORT handles found
 
   if (hid_service != nullptr) {
     BLECharacteristic *hid_report_map_char =
@@ -669,6 +683,18 @@ void BLEClientHID::configure_hid_client() {
     }
     std::vector<BLECharacteristic *> chars = hid_service->characteristics;
     ESP_LOGD(TAG, "[configure] HID service has %zu characteristics", chars.size());
+    // Count notify-capable HID_REPORT chars before registering so the log shows
+    // expected vs actual registrations.
+    for (BLECharacteristic *c : chars) {
+      if (c->uuid.get_uuid().uuid.uuid16 == ESP_GATT_UUID_HID_REPORT &&
+          (c->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0)
+        notify_chars++;
+    }
+    ESP_LOGI(TAG, "[configure] %d HID_REPORT notify handle(s) to register "
+             "(reconnect=%s — CCCDs must be re-applied per connection even "
+             "when report map is cached, because CCCD values are per-connection "
+             "link-layer state that resets to disabled when the peripheral disconnects)",
+             notify_chars, this->hid_report_map != nullptr ? "yes" : "no");
     for (BLECharacteristic *hid_char : chars) {
       if (hid_char->uuid.get_uuid().uuid.uuid16 == ESP_GATT_UUID_HID_REPORT) {
         if (hid_char->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) {
@@ -760,9 +786,10 @@ void BLEClientHID::configure_hid_client() {
                preferred_conn_params.timeout * 10.0f);
     }
   }
-  ESP_LOGD(TAG, "[configure] configure_hid_client() done: "
-           "notify_pending=%d report_map=%s hid_cp=0x%04X",
+  ESP_LOGI(TAG, "[configure] configure_hid_client() done: "
+           "notify_pending=%d/%d report_map=%s hid_cp=0x%04X",
            this->handles_waiting_for_notify_registration,
+           notify_chars,
            this->hid_report_map != nullptr ? "OK" : "MISSING",
            this->hid_control_point_handle_);
   // delete read data:
