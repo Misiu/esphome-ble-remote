@@ -79,13 +79,12 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   void register_last_event_usage_text_sensor(text_sensor::TextSensor *last_event_usage_text_sensor);
   void register_last_event_code_text_sensor(text_sensor::TextSensor *last_event_code_text_sensor);
   void register_last_event_value_sensor(sensor::Sensor *last_event_value_sensor);
-  void register_battery_sensor(sensor::Sensor * battery_sensor);
   void configure_hid_client();
   
  protected:
   void send_input_report_event(esp_ble_gattc_cb_param_t *p_data);
   uint8_t *parse_characteristic_data(ble_client::BLEService *service, uint16_t uuid);
-  HIDReportMap* hid_report_map;
+  HIDReportMap* hid_report_map = nullptr;
   std::vector<ble_client::BLECharacteristic *> characteristics;
   std::vector<uint16_t> handles_registered_for_notify;
   std::map<uint16_t, GATTReadData *> handles_to_read;
@@ -93,18 +92,28 @@ class BLEClientHID : public Component, public ble_client::BLEClientNode {
   text_sensor::TextSensor *last_event_usage_text_sensor = nullptr;
   text_sensor::TextSensor *last_event_code_text_sensor = nullptr;
   sensor::Sensor *last_event_value_sensor = nullptr;
-  sensor::Sensor *battery_sensor = nullptr;
   HIDState hid_state = HIDState::INIT;
-  uint16_t battery_handle;
-  uint16_t vendor_id;
-  uint16_t product_id;
-  uint16_t version;
-  std::string device_name;
-  std::string manufacturer;
-  std::string serial_number;
-  bool is_connected = false;
   uint8_t handles_waiting_for_notify_registration = 0;
   esp_ble_conn_update_params_t preferred_conn_params = {0};
+  // Keepalive: every KEEPALIVE_INTERVAL_MS, write "Exit Suspend" (0x01) then
+  // immediately "Suspend" (0x00) to the HID Control Point characteristic.
+  //
+  // Exit Suspend resets the remote's application-level idle timer (preventing
+  // the 5-minute HCI reason-0x13 self-disconnect).  Immediately writing
+  // Suspend afterwards returns the device to suspend mode so that the next
+  // button press triggers its LED feedback (the remote flashes the LED when
+  // it wakes from suspend to deliver a HID report to the host).
+  //
+  // Both writes use Write Without Response (ESP_GATT_WRITE_TYPE_NO_RSP).
+  // This is critical: GATT reads (used previously) require the remote to send
+  // an ATT Read Response.  If the BLE connection drops while a read is in
+  // flight, the remote is left with a queued but undelivered response.  When
+  // a new connection arrives the remote's GATT stack is in an inconsistent
+  // state and crashes (requiring a battery pull to recover).  Write Without
+  // Response has no such pending-state problem.
+  static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 90000;  // 90 seconds
+  uint16_t hid_control_point_handle_ = 0;  // HID CP for keepalive writes
+  uint32_t last_keepalive_ms_ = 0;
 };
 
 }  // namespace ble_client_hid
